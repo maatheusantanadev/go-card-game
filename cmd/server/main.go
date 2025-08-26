@@ -6,6 +6,7 @@ import (
 	"net"
 	"strings"
 	"sync"
+	"time"
 )
 
 type Player struct {
@@ -13,90 +14,92 @@ type Player struct {
 	Name string
 }
 
-var (
-	players   = make([]*Player, 0)
-	playerMux sync.Mutex
-)
+var waiting *Player     // jogador aguardando
+var matchMux sync.Mutex // trava para acessar "waiting"
 
 func main() {
-	fmt.Println("Iniciando jogo de cartas multiplayer...")
-	Start(":5000")
-}
-
-func Start(address string) {
-	listener, err := net.Listen("tcp", address)
-	if err != nil {
-		fmt.Println("Erro ao iniciar servidor:", err)
-		return
-	}
-	defer listener.Close()
-
-	fmt.Println("Servidor rodando em", address)
+	listener, _ := net.Listen("tcp", ":4000")
+	fmt.Println("Lobby rodando em :4000")
 
 	for {
-		conn, err := listener.Accept()
-		if err != nil {
-			fmt.Println("Erro ao aceitar conexão:", err)
-			continue
-		}
-		go handlePlayer(conn)
+		conn, _ := listener.Accept()
+		go handleLobby(conn)
 	}
 }
 
-func handlePlayer(conn net.Conn) {
-	defer conn.Close()
-
+func handleLobby(conn net.Conn) {
 	reader := bufio.NewReader(conn)
-
-	// --- Lê nome do jogador ---
 	name, _ := reader.ReadString('\n')
 	name = strings.TrimSpace(name)
 	if name == "" {
 		name = conn.RemoteAddr().String()
 	}
-
 	player := &Player{Conn: conn, Name: name}
 
-	// Adiciona jogador
-	playerMux.Lock()
-	players = append(players, player)
-	playerMux.Unlock()
+	matchMux.Lock()
+	if waiting == nil {
+		// primeiro jogador fica esperando
+		waiting = player
+		player.Conn.Write([]byte("⏳ Aguardando outro jogador...\n"))
+		matchMux.Unlock()
+	} else {
+		// já tinha alguém esperando → inicia partida
+		p1 := waiting
+		waiting = nil
+		matchMux.Unlock()
 
-	fmt.Printf("Novo jogador conectado: %s\n", player.Name)
+		go startMatch(p1, player)
+	}
+}
 
-	
-	defer func() {
-		playerMux.Lock()
-		for i, p := range players {
-			if p == player {
-				players = append(players[:i], players[i+1:]...)
-				break
-			}
+func startMatch(p1, p2 *Player) {
+	ln, _ := net.Listen("tcp", ":0") // cria porta livre para a sala
+	addr := ln.Addr().String()
+	fmt.Printf("🎮 Criando sala 1vs1 em %s (%s vs %s)\n", addr, p1.Name, p2.Name)
+
+	// informa os jogadores sobre a sala
+	p1.Conn.Write([]byte("Sala criada em: " + addr + "\n"))
+	p2.Conn.Write([]byte("Sala criada em: " + addr + "\n"))
+
+	// fecha conexões com o lobby
+	p1.Conn.Close()
+	p2.Conn.Close()
+
+	// espera exatamente 2 conexões na nova porta
+	players := []*Player{}
+	for len(players) < 2 {
+		conn, _ := ln.Accept()
+		reader := bufio.NewReader(conn)
+		name, _ := reader.ReadString('\n')
+		name = strings.TrimSpace(name)
+		if name == "" {
+			name = conn.RemoteAddr().String()
 		}
-		playerMux.Unlock()
-		fmt.Printf("Jogador desconectado: %s\n", player.Name)
-	}()
+		players = append(players, &Player{Conn: conn, Name: name})
+		fmt.Println("➡ Jogador entrou na sala:", name)
+	}
 
-	
+	fmt.Printf("✅ Sala iniciada: %s vs %s\n", players[0].Name, players[1].Name)
+	runMatch(players[0], players[1])
+}
+
+func runMatch(p1, p2 *Player) {
+	// cada mensagem/jogada é repassada ao adversário
+	go relay(p1, p2)
+	go relay(p2, p1)
+}
+
+func relay(src, dst *Player) {
+	reader := bufio.NewReader(src.Conn)
 	for {
-		message, err := reader.ReadString('\n')
+		src.Conn.SetReadDeadline(time.Now().Add(30 * time.Second)) // timeout
+		msg, err := reader.ReadString('\n')
 		if err != nil {
+			fmt.Printf("⚠ Jogador %s se desconectou\n", src.Name)
+			dst.Conn.Write([]byte(src.Name + " saiu da partida.\n"))
+			src.Conn.Close()
 			return
 		}
-		message = strings.TrimSpace(message)
-		if message == "" {
-			continue
-		}
-
-		fmt.Printf("[%s] %s\n", player.Name, message)
-
-		
-		playerMux.Lock()
-		for _, p := range players {
-			if p != player {
-				p.Conn.Write([]byte(fmt.Sprintf("[%s] %s\n", player.Name, message)))
-			}
-		}
-		playerMux.Unlock()
+		dst.Conn.Write([]byte(fmt.Sprintf("[%s] %s", src.Name, msg)))
 	}
 }
