@@ -1,0 +1,7 @@
+version: "3.9"
+services:
+  lobby:
+    build: .
+    container_name: lobby_server
+    ports:
+      - "4000:4000"
