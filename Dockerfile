@@ -15,7 +15,8 @@ COPY . .
 RUN go build -o server main.go
 
 # Expõe a porta do lobby
-EXPOSE 4000
+EXPOSE 4000/tcp
+EXPOSE 5000/udp
 
 # Comando 
 CMD ["./server"]

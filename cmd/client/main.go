@@ -11,7 +11,7 @@ import (
 	"time"
 )
 
-var pingChan = make(chan string, 1) // canal para atualizar latência
+var pingChan = make(chan string, 1)
 
 // igual ao servidor
 type GameAction struct {
@@ -22,7 +22,7 @@ type GameAction struct {
 func main() {
 	fmt.Println("Iniciando jogo de cartas multiplayer...")
 
-	// conecta no lobby
+	// conecta no servidor principal
 	conn, err := net.Dial("tcp", "localhost:4000")
 	if err != nil {
 		fmt.Println("Erro ao conectar no lobby:", err)
@@ -44,64 +44,27 @@ func main() {
 	// aguarda resposta do lobby
 	serverReader := bufio.NewReader(conn)
 
-	var salaTCP, salaUDP string
+	var salaUDP string
 
-	for {
-		line, err := serverReader.ReadString('\n')
-		if err != nil {
-			return
-		}
-		line = strings.TrimSpace(line)
-		fmt.Println(line)
-
-		if strings.HasPrefix(line, "Sala TCP:") {
-			salaTCP = strings.TrimSpace(strings.TrimPrefix(line, "Sala TCP:"))
-		}
-		if strings.HasPrefix(line, "Ping UDP:") {
-			salaUDP = strings.TrimSpace(strings.TrimPrefix(line, "Ping UDP:"))
-		}
-
-		// quando já temos ambos os endereços → conecta na partida
-		if salaTCP != "" && salaUDP != "" {
-			conn.Close()
-			playInMatch(salaTCP, salaUDP, name)
-			return
-		}
-	}
-}
-
-func playInMatch(addrTCP, addrUDP, name string) {
-	fmt.Println("🔗 sala:", addrTCP)
-	conn, err := net.Dial("tcp", addrTCP)
-	if err != nil {
-		fmt.Println("Erro ao conectar na sala:", err)
-		return
-	}
-	defer conn.Close()
-
-	// envia novamente o nome
-	conn.Write([]byte(name + "\n"))
-
-	// goroutine para ouvir servidor TCP (chat + respostas do jogo)
+	// goroutine para ouvir servidor (chat + respostas do jogo)
 	go func() {
-		serverReader := bufio.NewScanner(conn)
-		for serverReader.Scan() {
-			fmt.Printf("\r%s\nVocê: ", serverReader.Text())
-		}
-	}()
+		for {
+			line, err := serverReader.ReadString('\n')
+			if err != nil {
+				fmt.Println("⚠ Conexão encerrada pelo servidor.")
+				os.Exit(0)
+			}
+			line = strings.TrimSpace(line)
+			fmt.Printf("\r%s\nVocê: ", line)
 
-	// goroutine para medir latência UDP
-	go pingUDP(addrUDP)
-
-	// goroutine para exibir latência atualizada
-	go func() {
-		for ping := range pingChan {
-			fmt.Printf("\r%s\nVocê: ", ping)
+			if strings.HasPrefix(line, "Ping UDP:") {
+				salaUDP = strings.TrimSpace(strings.TrimPrefix(line, "Ping UDP:"))
+				go pingUDP(salaUDP)
+			}
 		}
 	}()
 
 	// loop de envio de mensagens (comandos ou chat)
-	stdin := bufio.NewReader(os.Stdin)
 	for {
 		fmt.Print("Você: ")
 		text, _ := stdin.ReadString('\n')
@@ -112,6 +75,11 @@ func playInMatch(addrTCP, addrUDP, name string) {
 
 		// ----------------------
 		// comandos de jogo
+		if text == "/ping" {
+			fmt.Println(getPing(salaUDP))
+			continue	
+	}
+
 		if strings.HasPrefix(text, "/play") {
 			parts := strings.Split(text, " ")
 			if len(parts) == 2 {
@@ -168,6 +136,29 @@ func pingUDP(addr string) {
 
 		rtt := time.Since(start)
 		pingChan <- fmt.Sprintf("🏓 Latência UDP: %v", rtt.Round(time.Millisecond))
-		time.Sleep(40 * time.Second)
+		time.Sleep(5 * time.Second)
 	}
 }
+
+func getPing(addr string) string {
+    serverAddr, _ := net.ResolveUDPAddr("udp", addr)
+    conn, err := net.DialUDP("udp", nil, serverAddr)
+    if err != nil {
+        return "Erro no UDP: " + err.Error()
+    }
+    defer conn.Close()
+
+    start := time.Now()
+    conn.Write([]byte("ping"))
+    conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+
+    buf := make([]byte, 1024)
+    _, _, err = conn.ReadFromUDP(buf)
+    if err != nil {
+        return "🏓 Latência: timeout"
+    }
+
+    rtt := time.Since(start)
+    return fmt.Sprintf("🏓 Latência UDP: %v", rtt.Round(time.Millisecond))
+}
+
