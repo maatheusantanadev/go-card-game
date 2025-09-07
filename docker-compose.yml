@@ -1,8 +1,18 @@
 version: "3.9"
+
 services:
   lobby:
     build: .
     container_name: lobby_server
     ports:
-      - "4000:4000/tcp"  
-      - "5000:5000/udp"   
+      - "4000:4000"   # TCP do lobby
+      - "5000:5000/udp" # UDP para ping/resposta
+    restart: unless-stopped
+    networks:
+      - lobby_net
+    stdin_open: true    # mantém STDIN aberto, útil para logs interativos
+    tty: true           # permite terminal interativo
+
+networks:
+  lobby_net:
+    driver: bridge

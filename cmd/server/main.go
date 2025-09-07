@@ -14,65 +14,71 @@ import (
 	"time"
 )
 
+// representa uma ação enviada pelo jogador (JSON)
 type AcaoJogo struct {
-	Acao   string `json:"acao"`
-	CartaID int   `json:"carta_id,omitempty"`
+	Acao   string `json:"acao"`          // tipo da ação, ex: "jogar_carta", "fim_turno"
+	CartaID int   `json:"carta_id,omitempty"` // id da carta, se aplicável
 }
 
+// representa um jogador conectado
 type Jogador struct {
 	ID        string
 	Nome      string
-	Conexao   net.Conn
-	Saida     chan string
-	EmPartida bool
-	EnderecoUDP string
-	mu        sync.Mutex
-	UltimoPing time.Duration
+	Conexao   net.Conn      // conexão TCP com o jogador
+	Saida     chan string   // canal para enviar mensagens ao jogador
+	EmPartida bool          // se está em uma partida
+	EnderecoUDP string       // endereço UDP do jogador (para ping)
+	mu        sync.Mutex    // mutex para proteger campos como EmPartida
+	UltimoPing time.Duration // último ping registrado
 }
 
+// representa uma partida entre dois jogadores
 type Partida struct {
 	ID      string
-	A, B    *Jogador
-	Turno   string // ID do jogador que está com a vez
-	Criada  time.Time
-	mu      sync.Mutex
-	Mao     map[string][]int
-	Vida    map[string]int // vida dos jogadores
+	A, B    *Jogador        // jogadores da partida
+	Turno   string           // ID do jogador que tem a vez
+	Criada  time.Time        // timestamp da criação
+	mu      sync.Mutex       // mutex para proteger o estado da partida
+	Mao     map[string][]int // cartas na mão dos jogadores (ID jogador -> cartas)
+	Vida    map[string]int   // vida dos jogadores (ID jogador -> vida)
 }
 
+// representa um pacote booster de cartas
 type PacoteBooster struct {
 	ID    string
-	Cartas []string
+	Cartas []string // lista de cartas do pacote
 }
 
+// Variáveis globais do servidor
 var (
 	jogadoresMu sync.Mutex
-	jogadores   = map[string]*Jogador{} // id -> jogador
+	jogadores   = map[string]*Jogador{} // mapa de ID -> jogador
 
-	filaPartida   = make(chan *Jogador, 100)
-	partidasAtivas = map[string]*Partida{}
-	partidasMu     sync.Mutex
+	filaPartida   = make(chan *Jogador, 100) // fila de matchmaking
+	partidasAtivas = map[string]*Partida{}   // partidas em andamento
+	partidasMu     sync.Mutex                // mutex para proteger partidasAtivas
 
 	// inventário de boosters
 	boostersMu sync.Mutex
 	boosters   []*PacoteBooster
 
-	cartasDisponiveis = map[int]string{}
+	cartasDisponiveis = map[int]string{} // catálogo de cartas do jogo
 
-	// aleatório
+	// gerador de números aleatórios
 	rnd = rand.New(rand.NewSource(time.Now().UnixNano()))
 )
 
 func main() {
 	rand.Seed(time.Now().UnixNano())
-	prepararBoosters(50) // preparar 50 pacotes booster
-	inicializarCartas()
 
+	// Inicializa boosters e cartas
+	prepararBoosters(50) // cria 50 pacotes booster
+	inicializarCartas()  // inicializa catálogo de cartas
 
-	// iniciar respondedor de ping UDP
+	// Inicia respondedor de ping UDP
 	go iniciarRespondedorUDP(":4001")
 
-	// iniciar servidor TCP do lobby
+	// Inicia servidor TCP do lobby
 	ln, err := net.Listen("tcp", ":4000")
 	if err != nil {
 		log.Fatal("Erro ao escutar:", err)
@@ -80,33 +86,35 @@ func main() {
 	defer ln.Close()
 	log.Println("Servidor TCP do lobby ouvindo em :4000")
 
-	// loop de matchmaking
+	// Loop de matchmaking para criar partidas
 	go loopPartidas()
 
+	// Loop principal de aceitação de conexões TCP
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
 			log.Println("Erro ao aceitar conexão:", err)
 			continue
 		}
-		go lidarConexao(conn)
+		go lidarConexao(conn) // trata cada jogador em goroutine separada
 	}
 }
 
+// cria o catálogo de cartas do jogo com raridades
 func inicializarCartas() {
-    for i := 1; i <= 20; i++ {
-        raridade := "Comum"
-        if i <= 5 {
-            raridade = "Rara"
-        } else if i <= 10 {
-            raridade = "Incomum"
-        }
-        cartasDisponiveis[i] = fmt.Sprintf("Carta %d (%s)", i, raridade)
-    }
-    log.Printf("Inicializado catálogo de %d cartas\n", len(cartasDisponiveis))
+	for i := 1; i <= 20; i++ {
+		raridade := "Comum"
+		if i <= 5 {
+			raridade = "Rara"
+		} else if i <= 10 {
+			raridade = "Incomum"
+		}
+		cartasDisponiveis[i] = fmt.Sprintf("Carta %d (%s)", i, raridade)
+	}
+	log.Printf("Inicializado catálogo de %d cartas\n", len(cartasDisponiveis))
 }
 
-
+// gera pacotes booster com cartas aleatórias
 func prepararBoosters(n int) {
 	boostersMu.Lock()
 	defer boostersMu.Unlock()
@@ -114,14 +122,15 @@ func prepararBoosters(n int) {
 		id := fmt.Sprintf("booster-%04d", i+1)
 		cartas := []string{
 			fmt.Sprintf("C%03d-R", rnd.Intn(100)), // carta rara
-			fmt.Sprintf("C%03d-U", rnd.Intn(200)), // incomum
-			fmt.Sprintf("C%03d-C", rnd.Intn(300)), // comum
+			fmt.Sprintf("C%03d-U", rnd.Intn(200)), // carta incomum
+			fmt.Sprintf("C%03d-C", rnd.Intn(300)), // carta comum
 		}
 		boosters = append(boosters, &PacoteBooster{ID: id, Cartas: cartas})
 	}
 	log.Printf("Preparados %d boosters\n", len(boosters))
 }
 
+// inicia um servidor UDP que responde "pong" a pings
 func iniciarRespondedorUDP(endereco string) {
 	pc, err := net.ListenPacket("udp", endereco)
 	if err != nil {
@@ -138,15 +147,16 @@ func iniciarRespondedorUDP(endereco string) {
 		}
 		payload := strings.TrimSpace(string(buf[:n]))
 		_ = payload
-		_, _ = pc.WriteTo([]byte("pong\n"), raddr)
+		_, _ = pc.WriteTo([]byte("pong\n"), raddr) // responde "pong"
 	}
 }
 
+// gerencia a conexão TCP de um jogador, leitura de comandos e mensagens
 func lidarConexao(conn net.Conn) {
 	defer conn.Close()
 	reader := bufio.NewReader(conn)
 
-	// leitura do nome
+	// solicita nome do jogador
 	conn.Write([]byte("Bem-vindo! Digite seu nome:\n"))
 	nomeLinha, err := reader.ReadString('\n')
 	if err != nil {
@@ -157,16 +167,19 @@ func lidarConexao(conn net.Conn) {
 	if nome == "" {
 		nome = "Jogador"
 	}
-	jogadorID := fmt.Sprintf("%d", time.Now().UnixNano())
+	jogadorID := fmt.Sprintf("%d", time.Now().UnixNano()) // ID único baseado em timestamp
 
+	// cria estrutura do jogador
 	j := &Jogador{
-		ID:        jogadorID,
-		Nome:      nome,
-		Conexao:   conn,
-		Saida:     make(chan string, 10),
-		EmPartida: false,
+		ID:          jogadorID,
+		Nome:        nome,
+		Conexao:     conn,
+		Saida:       make(chan string, 10),
+		EmPartida:   false,
 		EnderecoUDP: "localhost:4001",
 	}
+
+	// adiciona jogador à lista global
 	jogadoresMu.Lock()
 	jogadores[j.ID] = j
 	jogadoresMu.Unlock()
@@ -174,8 +187,10 @@ func lidarConexao(conn net.Conn) {
 	j.enviarMensagem(fmt.Sprintf("Ping UDP: %s\n", j.EnderecoUDP))
 	j.enviarMensagem("Comandos: /entrar, /sair, /jogar <idCarta>, /fim, /booster, ou mensagens de chat\n")
 
+	// goroutine que envia mensagens ao jogador
 	go escritorJogador(j)
 
+	// loop de leitura de mensagens do jogador
 	for {
 		linha, err := reader.ReadString('\n')
 		if err != nil {
@@ -188,11 +203,13 @@ func lidarConexao(conn net.Conn) {
 			continue
 		}
 
+		// comandos iniciados por "/"
 		if strings.HasPrefix(linha, "/") {
 			tratarComando(j, linha)
 			continue
 		}
 
+		// ações em JSON
 		if strings.HasPrefix(linha, "{") {
 			var acao AcaoJogo
 			if err := json.Unmarshal([]byte(linha), &acao); err != nil {
@@ -201,11 +218,13 @@ func lidarConexao(conn net.Conn) {
 			}
 			tratarAcao(j, acao)
 		} else {
+			// mensagem de chat normal
 			transmitir(fmt.Sprintf("[%s] %s", j.Nome, linha), j)
 		}
 	}
 }
 
+// envia uma mensagem para o jogador sem travar caso o canal esteja cheio
 func (j *Jogador) enviarMensagem(msg string) {
 	select {
 	case j.Saida <- msg:
@@ -213,6 +232,7 @@ func (j *Jogador) enviarMensagem(msg string) {
 	}
 }
 
+// escreve continuamente mensagens do canal para a conexão TCP
 func escritorJogador(j *Jogador) {
 	for msg := range j.Saida {
 		_, err := j.Conexao.Write([]byte(msg + "\n"))
@@ -223,6 +243,7 @@ func escritorJogador(j *Jogador) {
 	}
 }
 
+// remove o jogador da lista global e encerra partidas ativas se necessário
 func removerJogador(j *Jogador) {
 	jogadoresMu.Lock()
 	delete(jogadores, j.ID)
@@ -246,29 +267,32 @@ func removerJogador(j *Jogador) {
 		}
 	}
 	partidasMu.Unlock()
-	close(j.Saida)
+	close(j.Saida) // fecha canal de saída do jogador
 }
 
+// exibe as cartas na mão do jogador
 func mostrarMao(j *Jogador) {
-    p := encontrarPartidaPorJogador(j.ID)
-    if p == nil {
-        j.enviarMensagem("Você não está em uma partida")
-        return
-    }
-    p.mu.Lock()
-    defer p.mu.Unlock()
-    mao := p.Mao[j.ID]
-    var builder strings.Builder
-    builder.WriteString("Sua mão:\n")
-    for _, cid := range mao {
-        builder.WriteString(fmt.Sprintf("  [%d] %s\n", cid, cartasDisponiveis[cid]))
-    }
-    j.enviarMensagem(builder.String())
+	p := encontrarPartidaPorJogador(j.ID)
+	if p == nil {
+		j.enviarMensagem("Você não está em uma partida")
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	mao := p.Mao[j.ID]
+	var builder strings.Builder
+	builder.WriteString("Sua mão:\n")
+	for _, cid := range mao {
+		builder.WriteString(fmt.Sprintf("  [%d] %s\n", cid, cartasDisponiveis[cid]))
+	}
+	j.enviarMensagem(builder.String())
 }
 
+// interpreta comandos de texto do jogador
 func tratarComando(j *Jogador, linha string) {
 	switch {
 	case linha == "/entrar":
+		// entra na fila de partidas
 		j.mu.Lock()
 		if j.EmPartida {
 			j.mu.Unlock()
@@ -284,7 +308,7 @@ func tratarComando(j *Jogador, linha string) {
 		}
 	case linha == "/sair":
 		j.enviarMensagem("Você saiu da fila (não implementado)")
-	
+
 	case linha == "/mao":
 		mostrarMao(j)
 
@@ -293,21 +317,21 @@ func tratarComando(j *Jogador, linha string) {
 		builder.WriteString("Cartas do jogo:\n")
 		for id, nome := range cartasDisponiveis {
 			builder.WriteString(fmt.Sprintf("  [%d] %s\n", id, nome))
-    }
-    	j.enviarMensagem(builder.String())
-	
+		}
+		j.enviarMensagem(builder.String())
+
 	case strings.HasPrefix(linha, "/jogar "):
-        partes := strings.Split(linha, " ")
-        if len(partes) < 2 {
-            j.enviarMensagem("Uso: /jogar <id_carta>")
-            return
-        }
-        cartaID, err := strconv.Atoi(partes[1])
-        if err != nil {
-            j.enviarMensagem("ID da carta inválido.")
-            return
-        }
-        tratarAcao(j, AcaoJogo{Acao: "jogar_carta", CartaID: cartaID})
+		partes := strings.Split(linha, " ")
+		if len(partes) < 2 {
+			j.enviarMensagem("Uso: /jogar <id_carta>")
+			return
+		}
+		cartaID, err := strconv.Atoi(partes[1])
+		if err != nil {
+			j.enviarMensagem("ID da carta inválido.")
+			return
+		}
+		tratarAcao(j, AcaoJogo{Acao: "jogar_carta", CartaID: cartaID})
 
 	case linha == "/booster":
 		pacote, ok := pegarBooster()
@@ -316,13 +340,16 @@ func tratarComando(j *Jogador, linha string) {
 			return
 		}
 		j.enviarMensagem(fmt.Sprintf("Você abriu booster %s -> cartas: %v", pacote.ID, pacote.Cartas))
+
 	case strings.HasPrefix(linha, "/ping"):
 		j.enviarMensagem(fmt.Sprintf("Hora do servidor: %s", time.Now().Format(time.RFC3339)))
+
 	default:
 		j.enviarMensagem("Comando desconhecido")
 	}
 }
 
+// realiza o matchmaking entre jogadores na fila
 func loopPartidas() {
 	for {
 		a := <-filaPartida
@@ -359,25 +386,27 @@ func loopPartidas() {
 	}
 }
 
+// retorna uma mão aleatória de cartas do jogador
 func gerarMaoAleatoria(qtd int) []int {
-    mao := make([]int, 0, qtd)
-    ids := make([]int, 0, len(cartasDisponiveis))
-    for id := range cartasDisponiveis {
-        ids = append(ids, id)
-    }
+	mao := make([]int, 0, qtd)
+	ids := make([]int, 0, len(cartasDisponiveis))
+	for id := range cartasDisponiveis {
+		ids = append(ids, id)
+	}
 
-    for i := 0; i < qtd; i++ {
-        idx := rnd.Intn(len(ids))
-        mao = append(mao, ids[idx])
-        // remover para não repetir cartas na mesma mão
-        ids = append(ids[:idx], ids[idx+1:]...)
-        if len(ids) == 0 {
-            break
-        }
-    }
-    return mao
+	for i := 0; i < qtd; i++ {
+		idx := rnd.Intn(len(ids))
+		mao = append(mao, ids[idx])
+		// remover para não repetir cartas na mesma mão
+		ids = append(ids[:idx], ids[idx+1:]...)
+		if len(ids) == 0 {
+			break
+		}
+	}
+	return mao
 }
 
+// envia sinais periódicos para os jogadores da partida
 func rodarPartida(p *Partida) {
 	for {
 		time.Sleep(30 * time.Second)
@@ -392,6 +421,7 @@ func rodarPartida(p *Partida) {
 	}
 }
 
+// envia mensagem para todos jogadores fora de partidas
 func transmitir(msg string, origem *Jogador) {
 	jogadoresMu.Lock()
 	defer jogadoresMu.Unlock()
@@ -405,15 +435,15 @@ func transmitir(msg string, origem *Jogador) {
 	}
 }
 
-// Ao criar partida, inicializamos a vida
+// inicializa uma nova partida entre dois jogadores
 func criarPartida(a, b *Jogador) {
 	idPartida := fmt.Sprintf("partida-%d", time.Now().UnixNano())
 	p := &Partida{
-		ID:      idPartida,
-		A:       a,
-		B:       b,
-		Criada:  time.Now(),
-		Turno:   a.ID,
+		ID:     idPartida,
+		A:      a,
+		B:      b,
+		Criada: time.Now(),
+		Turno:  a.ID,
 		Mao: map[string][]int{
 			a.ID: gerarMaoAleatoria(5),
 			b.ID: gerarMaoAleatoria(5),
@@ -434,7 +464,7 @@ func criarPartida(a, b *Jogador) {
 	go rodarPartida(p)
 }
 
-// Função para calcular dano da carta
+// calcula o dano de uma carta com base em sua raridade
 func danoCarta(cartaID int) int {
 	nome := cartasDisponiveis[cartaID]
 	if strings.Contains(nome, "Rara") {
@@ -445,7 +475,7 @@ func danoCarta(cartaID int) int {
 	return 10 // Comum
 }
 
-// Alteração no "jogar_carta" para descontar vida
+// processa ações do jogador dentro de uma partida
 func tratarAcao(j *Jogador, acao AcaoJogo) {
 	switch acao.Acao {
 	case "jogar_carta":
@@ -517,6 +547,7 @@ func tratarAcao(j *Jogador, acao AcaoJogo) {
 			delete(partidasAtivas, p.ID)
 			partidasMu.Unlock()
 		}
+
 	case "fim_turno":
 		p := encontrarPartidaPorJogador(j.ID)
 		if p == nil {
@@ -532,11 +563,10 @@ func tratarAcao(j *Jogador, acao AcaoJogo) {
 		p.A.enviarMensagem(fmt.Sprintf("\n============================\nVez trocada! Agora: %s\n============================", p.Turno))
 		p.B.enviarMensagem(fmt.Sprintf("\n============================\nVez trocada! Agora: %s\n============================", p.Turno))
 		p.mu.Unlock()
-	// restante do código...
 	}
 }
 
-
+// retorna a partida em que o jogador está
 func encontrarPartidaPorJogador(jogadorID string) *Partida {
 	partidasMu.Lock()
 	defer partidasMu.Unlock()
@@ -548,6 +578,7 @@ func encontrarPartidaPorJogador(jogadorID string) *Partida {
 	return nil
 }
 
+// retorna um pacote booster disponível ou false se não houver
 func pegarBooster() (*PacoteBooster, bool) {
 	boostersMu.Lock()
 	defer boostersMu.Unlock()
@@ -556,6 +587,6 @@ func pegarBooster() (*PacoteBooster, bool) {
 	}
 	idx := len(boosters) - 1
 	pacote := boosters[idx]
-	boosters = boosters[:idx]
+	boosters = boosters[:idx] // remove do inventário
 	return pacote, true
 }

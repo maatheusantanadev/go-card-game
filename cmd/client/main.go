@@ -8,9 +8,9 @@ import (
 	"net"
 	"os"
 	"strings"
-	
 )
 
+// ponto de entrada do cliente, conecta ao servidor TCP e gerencia envio/recebimento de mensagens
 func main() {
 	// Conexão TCP com o servidor
 	conn, err := net.Dial("tcp", "localhost:4000")
@@ -21,7 +21,7 @@ func main() {
 
 	fmt.Println("Conectado ao servidor TCP em :4000")
 
-	// Leitura assíncrona (mensagens do servidor)
+	// Goroutine: leitura assíncrona de mensagens enviadas pelo servidor
 	go func() {
 		reader := bufio.NewReader(conn)
 		for {
@@ -34,13 +34,13 @@ func main() {
 		}
 	}()
 
-	// Enviar nome ao servidor (primeira linha obrigatória)
+	// Envia o nome do jogador ao servidor 
 	fmt.Print("Digite seu nome: ")
 	stdin := bufio.NewReader(os.Stdin)
 	name, _ := stdin.ReadString('\n')
 	conn.Write([]byte(name))
 
-	// Loop para comandos do jogador
+	// captura comandos do jogador e envia para o servidor
 	for {
 		fmt.Print("> ")
 		cmd, _ := stdin.ReadString('\n')
@@ -51,7 +51,7 @@ func main() {
 			return
 		}
 
-		// envia comando ou JSON de ação para o servidor
+		// Envia comando ou JSON de ação para o servidor
 		_, err := conn.Write([]byte(cmd + "\n"))
 		if err != nil {
 			log.Println("Erro ao enviar:", err)
