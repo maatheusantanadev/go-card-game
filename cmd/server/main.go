@@ -1,223 +1,561 @@
+// servidor.go
 package main
 
 import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"log"
+	"math/rand"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
 
-type Player struct {
-	Conn   net.Conn
-	Name   string
-	RoomID string
+type AcaoJogo struct {
+	Acao   string `json:"acao"`
+	CartaID int   `json:"carta_id,omitempty"`
 }
 
-type Card struct {
-	ID     int    `json:"id"`
-	Name   string `json:"name"`
-	Rarity string `json:"rarity"`
-	Power  int    `json:"power"`
+type Jogador struct {
+	ID        string
+	Nome      string
+	Conexao   net.Conn
+	Saida     chan string
+	EmPartida bool
+	EnderecoUDP string
+	mu        sync.Mutex
+	UltimoPing time.Duration
 }
 
-type GameState struct {
-	Players [2]*Player
-	Decks   map[string][]Card
-	Hands   map[string][]Card
-	Turn    int
-	Started bool
+type Partida struct {
+	ID      string
+	A, B    *Jogador
+	Turno   string // ID do jogador que está com a vez
+	Criada  time.Time
 	mu      sync.Mutex
+	Mao     map[string][]int
+	Vida    map[string]int // vida dos jogadores
 }
 
-type GameAction struct {
-	Action string `json:"action"`
-	CardID int    `json:"card_id,omitempty"`
+type PacoteBooster struct {
+	ID    string
+	Cartas []string
 }
 
 var (
-	waiting       *Player
-	matchMux      sync.Mutex
-	activeMatches = make(map[string]*GameState) // map[roomID]GameState
-	udpConn       *net.UDPConn
+	jogadoresMu sync.Mutex
+	jogadores   = map[string]*Jogador{} // id -> jogador
+
+	filaPartida   = make(chan *Jogador, 100)
+	partidasAtivas = map[string]*Partida{}
+	partidasMu     sync.Mutex
+
+	// inventário de boosters
+	boostersMu sync.Mutex
+	boosters   []*PacoteBooster
+
+	cartasDisponiveis = map[int]string{}
+
+	// aleatório
+	rnd = rand.New(rand.NewSource(time.Now().UnixNano()))
 )
 
 func main() {
-	// TCP: lobby + partidas
-	tcpListener, _ := net.Listen("tcp", ":4000")
-	fmt.Println("Servidor TCP rodando em :4000")
+	rand.Seed(time.Now().UnixNano())
+	prepararBoosters(50) // preparar 50 pacotes booster
+	inicializarCartas()
 
-	// UDP: latência
-	udpAddr, _ := net.ResolveUDPAddr("udp", ":5000")
-	udpConn, _ = net.ListenUDP("udp", udpAddr)
-	fmt.Println("Servidor UDP rodando em :5000")
-	go udpServer(udpConn)
+
+	// iniciar respondedor de ping UDP
+	go iniciarRespondedorUDP(":4001")
+
+	// iniciar servidor TCP do lobby
+	ln, err := net.Listen("tcp", ":4000")
+	if err != nil {
+		log.Fatal("Erro ao escutar:", err)
+	}
+	defer ln.Close()
+	log.Println("Servidor TCP do lobby ouvindo em :4000")
+
+	// loop de matchmaking
+	go loopPartidas()
 
 	for {
-		conn, _ := tcpListener.Accept()
-		go handleTCP(conn)
-	}
-}
-
-// ================= TCP =================
-
-func handleTCP(conn net.Conn) {
-	reader := bufio.NewReader(conn)
-	name, _ := reader.ReadString('\n')
-	name = strings.TrimSpace(name)
-	if name == "" {
-		name = conn.RemoteAddr().String()
-	}
-	player := &Player{Conn: conn, Name: name}
-
-	// Mutex para entrada de partidas
-	matchMux.Lock()
-	if waiting == nil {
-		waiting = player
-		player.Conn.Write([]byte("⏳ Aguardando outro jogador...\n"))
-		matchMux.Unlock()
-	} else {
-		p1 := waiting
-		waiting = nil
-		matchMux.Unlock()
-
-		roomID := fmt.Sprintf("%d", time.Now().UnixNano())
-		game := &GameState{
-			Players: [2]*Player{p1, player},
-			Decks:   map[string][]Card{},
-			Hands:   map[string][]Card{},
-			Turn:    0,
-			Started: true,
-		}
-
-		activeMatches[roomID] = game
-		p1.RoomID = roomID
-		player.RoomID = roomID
-
-		startMatch(game)
-	}
-}
-
-func startMatch(state *GameState) {
-	p1 := state.Players[0]
-	p2 := state.Players[1]
-
-	// decks iniciais
-	state.Decks[p1.Name] = []Card{
-		{ID: 1, Name: "Espadachim", Rarity: "Common", Power: 2},
-		{ID: 2, Name: "Mago", Rarity: "Rare", Power: 4},
-	}
-	state.Decks[p2.Name] = []Card{
-		{ID: 3, Name: "Arqueira", Rarity: "Common", Power: 3},
-		{ID: 4, Name: "Dragão", Rarity: "Epic", Power: 6},
-	}
-
-	state.Hands[p1.Name] = state.Decks[p1.Name][:1]
-	state.Hands[p2.Name] = state.Decks[p2.Name][:1]
-
-	for _, p := range state.Players {
-		p.Conn.Write([]byte(fmt.Sprintf("✅ Partida iniciada! Sala: %s\n", p.RoomID)))
-        p.Conn.Write([]byte("Ping UDP: localhost:5000\n"))
-		showHand(p, state)
-	}
-
-	for _, p := range state.Players {
-		go relay(p, state)
-	}
-}
-
-func relay(player *Player, state *GameState) {
-	reader := bufio.NewReader(player.Conn)
-	for {
-		msg, err := reader.ReadString('\n')
+		conn, err := ln.Accept()
 		if err != nil {
-			fmt.Printf("⚠ Jogador %s se desconectou\n", player.Name)
-			return
-		}
-		msg = strings.TrimSpace(msg)
-
-		var action GameAction
-		if err := json.Unmarshal([]byte(msg), &action); err == nil {
-			state.mu.Lock() // mutex para concorrência no jogo
-			response := handleAction(state, player, action)
-			state.mu.Unlock()
-			for _, p := range state.Players {
-				p.Conn.Write([]byte(response + "\n"))
-			}
-		} else {
-			// chat simples
-			for _, p := range state.Players {
-				if p.Name != player.Name {
-					p.Conn.Write([]byte(fmt.Sprintf("[%s] %s\n", player.Name, msg)))
-				}
-			}
-		}
-	}
-}
-
-func handleAction(state *GameState, player *Player, action GameAction) string {
-	current := state.Players[state.Turn]
-	if player.Name != current.Name {
-		return "❌ Não é sua vez."
-	}
-
-	switch action.Action {
-	case "play_card":
-		hand := state.Hands[player.Name]
-		for i, card := range hand {
-			if card.ID == action.CardID {
-				state.Hands[player.Name] = append(hand[:i], hand[i+1:]...)
-				return fmt.Sprintf("🃏 %s jogou %s!", player.Name, card.Name)
-			}
-		}
-		return "❌ Carta não encontrada."
-	case "end_turn":
-		state.Turn = (state.Turn + 1) % 2
-		next := state.Players[state.Turn]
-		showHand(next, state)
-		return fmt.Sprintf("🔄 Turno passou para %s", next.Name)
-	case "draw_booster":
-		// Mutex para concorrência na compra de pacotes
-		state.mu.Lock()
-		defer state.mu.Unlock()
-		newCard := Card{ID: 99, Name: "Carta Rara", Rarity: "Legend", Power: 5}
-		state.Hands[player.Name] = append(state.Hands[player.Name], newCard)
-		return fmt.Sprintf("📦 %s abriu um booster e recebeu %s!", player.Name, newCard.Name)
-	default:
-		return "❌ Ação desconhecida."
-	}
-}
-
-func showHand(player *Player, state *GameState) {
-	hand := state.Hands[player.Name]
-	if len(hand) == 0 {
-		player.Conn.Write([]byte("🖐️ Sua mão está vazia.\n"))
-		return
-	}
-	var sb strings.Builder
-	sb.WriteString("🖐️ Sua mão:\n")
-	for _, c := range hand {
-		sb.WriteString(fmt.Sprintf("  [%d] %s (%s, Poder %d)\n", c.ID, c.Name, c.Rarity, c.Power))
-	}
-	player.Conn.Write([]byte(sb.String()))
-}
-
-// ================= UDP =================
-
-func udpServer(conn *net.UDPConn) {
-	defer conn.Close()
-	buf := make([]byte, 1024)
-	for {
-		n, clientAddr, err := conn.ReadFromUDP(buf)
-		if err != nil {
-			fmt.Println("⚠ Erro no UDP:", err)
+			log.Println("Erro ao aceitar conexão:", err)
 			continue
 		}
-		msg := strings.TrimSpace(string(buf[:n]))
-		if msg == "ping" {
-			conn.WriteToUDP([]byte("pong"), clientAddr)
+		go lidarConexao(conn)
+	}
+}
+
+func inicializarCartas() {
+    for i := 1; i <= 20; i++ {
+        raridade := "Comum"
+        if i <= 5 {
+            raridade = "Rara"
+        } else if i <= 10 {
+            raridade = "Incomum"
+        }
+        cartasDisponiveis[i] = fmt.Sprintf("Carta %d (%s)", i, raridade)
+    }
+    log.Printf("Inicializado catálogo de %d cartas\n", len(cartasDisponiveis))
+}
+
+
+func prepararBoosters(n int) {
+	boostersMu.Lock()
+	defer boostersMu.Unlock()
+	for i := 0; i < n; i++ {
+		id := fmt.Sprintf("booster-%04d", i+1)
+		cartas := []string{
+			fmt.Sprintf("C%03d-R", rnd.Intn(100)), // carta rara
+			fmt.Sprintf("C%03d-U", rnd.Intn(200)), // incomum
+			fmt.Sprintf("C%03d-C", rnd.Intn(300)), // comum
+		}
+		boosters = append(boosters, &PacoteBooster{ID: id, Cartas: cartas})
+	}
+	log.Printf("Preparados %d boosters\n", len(boosters))
+}
+
+func iniciarRespondedorUDP(endereco string) {
+	pc, err := net.ListenPacket("udp", endereco)
+	if err != nil {
+		log.Fatal("Erro ao iniciar UDP:", err)
+	}
+	defer pc.Close()
+	log.Println("Respondedor UDP ouvindo em", endereco)
+	buf := make([]byte, 1024)
+	for {
+		n, raddr, err := pc.ReadFrom(buf)
+		if err != nil {
+			log.Println("Erro ao ler UDP:", err)
+			continue
+		}
+		payload := strings.TrimSpace(string(buf[:n]))
+		_ = payload
+		_, _ = pc.WriteTo([]byte("pong\n"), raddr)
+	}
+}
+
+func lidarConexao(conn net.Conn) {
+	defer conn.Close()
+	reader := bufio.NewReader(conn)
+
+	// leitura do nome
+	conn.Write([]byte("Bem-vindo! Digite seu nome:\n"))
+	nomeLinha, err := reader.ReadString('\n')
+	if err != nil {
+		log.Println("Erro ao ler nome:", err)
+		return
+	}
+	nome := strings.TrimSpace(nomeLinha)
+	if nome == "" {
+		nome = "Jogador"
+	}
+	jogadorID := fmt.Sprintf("%d", time.Now().UnixNano())
+
+	j := &Jogador{
+		ID:        jogadorID,
+		Nome:      nome,
+		Conexao:   conn,
+		Saida:     make(chan string, 10),
+		EmPartida: false,
+		EnderecoUDP: "localhost:4001",
+	}
+	jogadoresMu.Lock()
+	jogadores[j.ID] = j
+	jogadoresMu.Unlock()
+
+	j.enviarMensagem(fmt.Sprintf("Ping UDP: %s\n", j.EnderecoUDP))
+	j.enviarMensagem("Comandos: /entrar, /sair, /jogar <idCarta>, /fim, /booster, ou mensagens de chat\n")
+
+	go escritorJogador(j)
+
+	for {
+		linha, err := reader.ReadString('\n')
+		if err != nil {
+			log.Printf("Jogador %s desconectou: %v\n", j.Nome, err)
+			removerJogador(j)
+			return
+		}
+		linha = strings.TrimSpace(linha)
+		if linha == "/" {
+			continue
+		}
+
+		if strings.HasPrefix(linha, "/") {
+			tratarComando(j, linha)
+			continue
+		}
+
+		if strings.HasPrefix(linha, "{") {
+			var acao AcaoJogo
+			if err := json.Unmarshal([]byte(linha), &acao); err != nil {
+				j.enviarMensagem("Ação inválida (JSON incorreto)\n")
+				continue
+			}
+			tratarAcao(j, acao)
+		} else {
+			transmitir(fmt.Sprintf("[%s] %s", j.Nome, linha), j)
 		}
 	}
+}
+
+func (j *Jogador) enviarMensagem(msg string) {
+	select {
+	case j.Saida <- msg:
+	default:
+	}
+}
+
+func escritorJogador(j *Jogador) {
+	for msg := range j.Saida {
+		_, err := j.Conexao.Write([]byte(msg + "\n"))
+		if err != nil {
+			log.Println("Erro ao escrever para", j.ID, err)
+			return
+		}
+	}
+}
+
+func removerJogador(j *Jogador) {
+	jogadoresMu.Lock()
+	delete(jogadores, j.ID)
+	jogadoresMu.Unlock()
+	partidasMu.Lock()
+	for mid, p := range partidasAtivas {
+		if p.A.ID == j.ID || p.B.ID == j.ID {
+			var oponente *Jogador
+			if p.A.ID == j.ID {
+				oponente = p.B
+			} else {
+				oponente = p.A
+			}
+			if oponente != nil {
+				oponente.enviarMensagem("Oponente desconectou, partida encerrada")
+				oponente.mu.Lock()
+				oponente.EmPartida = false
+				oponente.mu.Unlock()
+			}
+			delete(partidasAtivas, mid)
+		}
+	}
+	partidasMu.Unlock()
+	close(j.Saida)
+}
+
+func mostrarMao(j *Jogador) {
+    p := encontrarPartidaPorJogador(j.ID)
+    if p == nil {
+        j.enviarMensagem("Você não está em uma partida")
+        return
+    }
+    p.mu.Lock()
+    defer p.mu.Unlock()
+    mao := p.Mao[j.ID]
+    var builder strings.Builder
+    builder.WriteString("Sua mão:\n")
+    for _, cid := range mao {
+        builder.WriteString(fmt.Sprintf("  [%d] %s\n", cid, cartasDisponiveis[cid]))
+    }
+    j.enviarMensagem(builder.String())
+}
+
+func tratarComando(j *Jogador, linha string) {
+	switch {
+	case linha == "/entrar":
+		j.mu.Lock()
+		if j.EmPartida {
+			j.mu.Unlock()
+			j.enviarMensagem("Você já está em uma partida")
+			return
+		}
+		j.mu.Unlock()
+		select {
+		case filaPartida <- j:
+			j.enviarMensagem("Entrou na fila de partidas...")
+		default:
+			j.enviarMensagem("Fila cheia, tente mais tarde")
+		}
+	case linha == "/sair":
+		j.enviarMensagem("Você saiu da fila (não implementado)")
+	
+	case linha == "/mao":
+		mostrarMao(j)
+
+	case linha == "/cartas":
+		var builder strings.Builder
+		builder.WriteString("Cartas do jogo:\n")
+		for id, nome := range cartasDisponiveis {
+			builder.WriteString(fmt.Sprintf("  [%d] %s\n", id, nome))
+    }
+    	j.enviarMensagem(builder.String())
+	
+	case strings.HasPrefix(linha, "/jogar "):
+        partes := strings.Split(linha, " ")
+        if len(partes) < 2 {
+            j.enviarMensagem("Uso: /jogar <id_carta>")
+            return
+        }
+        cartaID, err := strconv.Atoi(partes[1])
+        if err != nil {
+            j.enviarMensagem("ID da carta inválido.")
+            return
+        }
+        tratarAcao(j, AcaoJogo{Acao: "jogar_carta", CartaID: cartaID})
+
+	case linha == "/booster":
+		pacote, ok := pegarBooster()
+		if !ok {
+			j.enviarMensagem("Não há boosters disponíveis")
+			return
+		}
+		j.enviarMensagem(fmt.Sprintf("Você abriu booster %s -> cartas: %v", pacote.ID, pacote.Cartas))
+	case strings.HasPrefix(linha, "/ping"):
+		j.enviarMensagem(fmt.Sprintf("Hora do servidor: %s", time.Now().Format(time.RFC3339)))
+	default:
+		j.enviarMensagem("Comando desconhecido")
+	}
+}
+
+func loopPartidas() {
+	for {
+		a := <-filaPartida
+		select {
+		case b := <-filaPartida:
+			a.mu.Lock()
+			if a.EmPartida {
+				a.mu.Unlock()
+				go func() { filaPartida <- b }()
+				continue
+			}
+			a.EmPartida = true
+			a.mu.Unlock()
+
+			b.mu.Lock()
+			if b.EmPartida {
+				b.mu.Unlock()
+				a.mu.Lock()
+				a.EmPartida = false
+				a.mu.Unlock()
+				go func() { filaPartida <- a }()
+				continue
+			}
+			b.EmPartida = true
+			b.mu.Unlock()
+
+			criarPartida(a, b)
+		case <-time.After(30 * time.Second):
+			select {
+			case filaPartida <- a:
+			default:
+			}
+		}
+	}
+}
+
+func gerarMaoAleatoria(qtd int) []int {
+    mao := make([]int, 0, qtd)
+    ids := make([]int, 0, len(cartasDisponiveis))
+    for id := range cartasDisponiveis {
+        ids = append(ids, id)
+    }
+
+    for i := 0; i < qtd; i++ {
+        idx := rnd.Intn(len(ids))
+        mao = append(mao, ids[idx])
+        // remover para não repetir cartas na mesma mão
+        ids = append(ids[:idx], ids[idx+1:]...)
+        if len(ids) == 0 {
+            break
+        }
+    }
+    return mao
+}
+
+func rodarPartida(p *Partida) {
+	for {
+		time.Sleep(30 * time.Second)
+		partidasMu.Lock()
+		_, ok := partidasAtivas[p.ID]
+		partidasMu.Unlock()
+		if !ok {
+			return
+		}
+		p.A.enviarMensagem(fmt.Sprintf("Sinal da partida %s", p.ID))
+		p.B.enviarMensagem(fmt.Sprintf("Sinal da partida %s", p.ID))
+	}
+}
+
+func transmitir(msg string, origem *Jogador) {
+	jogadoresMu.Lock()
+	defer jogadoresMu.Unlock()
+	for _, j := range jogadores {
+		j.mu.Lock()
+		emPartida := j.EmPartida
+		j.mu.Unlock()
+		if !emPartida && j.ID != origem.ID {
+			j.enviarMensagem(msg)
+		}
+	}
+}
+
+// Ao criar partida, inicializamos a vida
+func criarPartida(a, b *Jogador) {
+	idPartida := fmt.Sprintf("partida-%d", time.Now().UnixNano())
+	p := &Partida{
+		ID:      idPartida,
+		A:       a,
+		B:       b,
+		Criada:  time.Now(),
+		Turno:   a.ID,
+		Mao: map[string][]int{
+			a.ID: gerarMaoAleatoria(5),
+			b.ID: gerarMaoAleatoria(5),
+		},
+		Vida: map[string]int{
+			a.ID: 100,
+			b.ID: 100,
+		},
+	}
+
+	partidasMu.Lock()
+	partidasAtivas[idPartida] = p
+	partidasMu.Unlock()
+
+	a.enviarMensagem(fmt.Sprintf("\n============================\nVocê foi pareado com %s!\nID da partida: %s\nVida inicial: 100\n============================", b.Nome, idPartida))
+	b.enviarMensagem(fmt.Sprintf("\n============================\nVocê foi pareado com %s!\nID da partida: %s\nVida inicial: 100\n============================", a.Nome, idPartida))
+
+	go rodarPartida(p)
+}
+
+// Função para calcular dano da carta
+func danoCarta(cartaID int) int {
+	nome := cartasDisponiveis[cartaID]
+	if strings.Contains(nome, "Rara") {
+		return 30
+	} else if strings.Contains(nome, "Incomum") {
+		return 20
+	}
+	return 10 // Comum
+}
+
+// Alteração no "jogar_carta" para descontar vida
+func tratarAcao(j *Jogador, acao AcaoJogo) {
+	switch acao.Acao {
+	case "jogar_carta":
+		p := encontrarPartidaPorJogador(j.ID)
+		if p == nil {
+			j.enviarMensagem("Você não está em uma partida")
+			return
+		}
+		p.mu.Lock()
+		defer p.mu.Unlock()
+
+		if p.Turno != j.ID {
+			j.enviarMensagem("Não é sua vez")
+			return
+		}
+
+		mao := p.Mao[j.ID]
+		pos := -1
+		for i, cid := range mao {
+			if cid == acao.CartaID {
+				pos = i
+				break
+			}
+		}
+		if pos == -1 {
+			j.enviarMensagem("Carta não encontrada na mão")
+			return
+		}
+
+		// remove carta da mão
+		mao = append(mao[:pos], mao[pos+1:]...)
+		p.Mao[j.ID] = mao
+
+		// determina o oponente
+		var oponenteID string
+		if p.A.ID == j.ID {
+			oponenteID = p.B.ID
+		} else {
+			oponenteID = p.A.ID
+		}
+
+		// calcula dano e aplica
+		dano := danoCarta(acao.CartaID)
+		p.Vida[oponenteID] -= dano
+		if p.Vida[oponenteID] < 0 {
+			p.Vida[oponenteID] = 0
+		}
+
+		nomeCarta := cartasDisponiveis[acao.CartaID]
+		msg := fmt.Sprintf("\n%s jogou a carta [%d] %s causando %d de dano!\nVida de %s: %d | Vida de %s: %d\n",
+			j.Nome, acao.CartaID, nomeCarta, dano,
+			j.Nome, p.Vida[j.ID], "Oponente", p.Vida[oponenteID],
+		)
+		p.A.enviarMensagem(msg)
+		p.B.enviarMensagem(msg)
+
+		// verifica vitória
+		if p.Vida[oponenteID] <= 0 {
+			p.A.enviarMensagem(fmt.Sprintf("\n============================\n%s venceu a partida!\n============================", j.Nome))
+			p.B.enviarMensagem(fmt.Sprintf("\n============================\n%s venceu a partida!\n============================", j.Nome))
+			p.A.mu.Lock()
+			p.A.EmPartida = false
+			p.A.mu.Unlock()
+			p.B.mu.Lock()
+			p.B.EmPartida = false
+			p.B.mu.Unlock()
+
+			partidasMu.Lock()
+			delete(partidasAtivas, p.ID)
+			partidasMu.Unlock()
+		}
+	case "fim_turno":
+		p := encontrarPartidaPorJogador(j.ID)
+		if p == nil {
+			j.enviarMensagem("Você não está em uma partida")
+			return
+		}
+		p.mu.Lock()
+		if p.Turno == p.A.ID {
+			p.Turno = p.B.ID
+		} else {
+			p.Turno = p.A.ID
+		}
+		p.A.enviarMensagem(fmt.Sprintf("\n============================\nVez trocada! Agora: %s\n============================", p.Turno))
+		p.B.enviarMensagem(fmt.Sprintf("\n============================\nVez trocada! Agora: %s\n============================", p.Turno))
+		p.mu.Unlock()
+	// restante do código...
+	}
+}
+
+
+func encontrarPartidaPorJogador(jogadorID string) *Partida {
+	partidasMu.Lock()
+	defer partidasMu.Unlock()
+	for _, p := range partidasAtivas {
+		if p.A.ID == jogadorID || p.B.ID == jogadorID {
+			return p
+		}
+	}
+	return nil
+}
+
+func pegarBooster() (*PacoteBooster, bool) {
+	boostersMu.Lock()
+	defer boostersMu.Unlock()
+	if len(boosters) == 0 {
+		return nil, false
+	}
+	idx := len(boosters) - 1
+	pacote := boosters[idx]
+	boosters = boosters[:idx]
+	return pacote, true
 }
