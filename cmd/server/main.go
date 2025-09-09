@@ -157,7 +157,6 @@ func lidarConexao(conn net.Conn) {
 	reader := bufio.NewReader(conn)
 
 	// solicita nome do jogador
-	conn.Write([]byte("Bem-vindo! Digite seu nome:\n"))
 	nomeLinha, err := reader.ReadString('\n')
 	if err != nil {
 		log.Println("Erro ao ler nome:", err)
@@ -185,7 +184,7 @@ func lidarConexao(conn net.Conn) {
 	jogadoresMu.Unlock()
 
 	j.enviarMensagem(fmt.Sprintf("Ping UDP: %s\n", j.EnderecoUDP))
-	j.enviarMensagem("Comandos: /entrar, /sair, /jogar <idCarta>, /fim, /booster, ou mensagens de chat\n")
+	j.enviarMensagem("Comandos: /entrar, /sair, /jogar <idCarta>, /mao, /cartas, /fim, /booster, ou mensagens de chat\n")
 
 	// goroutine que envia mensagens ao jogador
 	go escritorJogador(j)
