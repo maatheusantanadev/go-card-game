@@ -415,8 +415,8 @@ func rodarPartida(p *Partida) {
 		if !ok {
 			return
 		}
-		p.A.enviarMensagem(fmt.Sprintf("Sinal da partida %s", p.ID))
-		p.B.enviarMensagem(fmt.Sprintf("Sinal da partida %s", p.ID))
+		p.A.enviarMensagem(fmt.Sprintf("\nSinal da partida %s\n", p.ID))
+		p.B.enviarMensagem(fmt.Sprintf("\nSinal da partida %s\n", p.ID))
 	}
 }
 
@@ -546,6 +546,15 @@ func tratarAcao(j *Jogador, acao AcaoJogo) {
 			delete(partidasAtivas, p.ID)
 			partidasMu.Unlock()
 		}
+
+		// troca a vez automaticamente
+		if p.Turno == p.A.ID {
+        	p.Turno = p.B.ID
+		} else {
+			p.Turno = p.A.ID
+		}
+			p.A.enviarMensagem(fmt.Sprintf("\n============================\nVez trocada! %s passou a vez\n============================", j.Nome))
+			p.B.enviarMensagem(fmt.Sprintf("\n============================\nVez trocada! %s passou a vez\n============================", j.Nome))
 
 	case "fim_turno":
 		p := encontrarPartidaPorJogador(j.ID)

@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"time"
 )
 
 // ponto de entrada do cliente, conecta ao servidor TCP e gerencia envio/recebimento de mensagens
@@ -51,6 +52,17 @@ func main() {
 			return
 		}
 
+		if cmd == "/ping" {
+        // mede latência usando UDP
+        latencia := medirPingUDP("localhost:4001")
+        if latencia > 0 {
+            fmt.Printf("Servidor: Latência UDP = %d ms\n", latencia.Milliseconds())
+        } else {
+            fmt.Println("Servidor: ping falhou")
+        }
+        continue
+    	}
+
 		// Envia comando ou JSON de ação para o servidor
 		_, err := conn.Write([]byte(cmd + "\n"))
 		if err != nil {
@@ -59,3 +71,36 @@ func main() {
 		}
 	}
 }
+
+// medirPingUDP envia um pacote UDP "ping" e espera por "pong", retornando a latência
+func medirPingUDP(endereco string) time.Duration {
+    conn, err := net.Dial("udp", endereco)
+    if err != nil {
+        log.Println("Erro UDP:", err)
+        return 0
+    }
+    defer conn.Close()
+
+    inicio := time.Now()
+    _, err = conn.Write([]byte("ping"))
+    if err != nil {
+        log.Println("Erro ao enviar ping:", err)
+        return 0
+    }
+
+    buf := make([]byte, 16)
+    conn.SetReadDeadline(time.Now().Add(2 * time.Second)) // timeout
+    n, err := conn.Read(buf)
+    if err != nil {
+        log.Println("Erro ao ler resposta UDP:", err)
+        return 0
+    }
+
+    resposta := strings.TrimSpace(string(buf[:n]))
+    if resposta == "pong" {
+        return time.Since(inicio)
+    }
+    return 0
+}
+
+
