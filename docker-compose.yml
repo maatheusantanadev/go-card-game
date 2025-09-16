@@ -6,7 +6,7 @@ services:
     container_name: lobby_server
     ports:
       - "4000:4000"     # TCP do lobby
-      - "5000:5000/udp" # UDP para ping/resposta
+      - "4001:4001/udp" # UDP para ping/resposta
     restart: unless-stopped
     networks:
       - lobby_net
