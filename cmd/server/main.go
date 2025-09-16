@@ -340,9 +340,6 @@ func tratarComando(j *Jogador, linha string) {
 		}
 		j.enviarMensagem(fmt.Sprintf("Você abriu booster %s -> cartas: %v", pacote.ID, pacote.Cartas))
 
-	case strings.HasPrefix(linha, "/ping"):
-		j.enviarMensagem(fmt.Sprintf("Hora do servidor: %s", time.Now().Format(time.RFC3339)))
-
 	default:
 		j.enviarMensagem("Comando desconhecido")
 	}
