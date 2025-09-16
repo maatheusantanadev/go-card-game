@@ -13,6 +13,6 @@ RUN go build -o server ./cmd/server/main.go && \
 
 # Expõe as portas do servidor
 EXPOSE 4000
-EXPOSE 5000/udp
+EXPOSE 4001/udp
 
 CMD ["./server"]
